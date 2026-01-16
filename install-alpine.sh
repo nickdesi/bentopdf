@@ -11,15 +11,17 @@ TEMPLATE="alpine" # Will be dynamically resolved
 CT_ID=""
 CT_NAME="alpine-bentopdf"
 CT_PASSWORD="ChangeMe123!" # Temporary password
-DISK_SIZE="4G"
+DISK_SIZE="4"
 RAM_SIZE="2048"
 CORES="2"
 BRIDGE="vmbr0"
 IP="dhcp"
+STORAGE_POOL="local-lvm"
 
 # Colors
 green=$(tput setaf 2)
 red=$(tput setaf 1)
+yellow=$(tput setaf 3)
 reset=$(tput sgr0)
 
 msg_info() { echo -e "${green}[INFO] $1${reset}"; }
@@ -31,41 +33,71 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-# Input Prompts
-read -p "Enter Container ID (e.g., 105): " CT_ID
-if [ -z "$CT_ID" ]; then msg_err "ID is required"; exit 1; fi
-
-if pct status $CT_ID >/dev/null 2>&1; then
-   msg_err "Container $CT_ID already exists!"
-   exit 1
+# Check for whiptail
+if ! command -v whiptail &> /dev/null; then
+    msg_err "Whiptail is required but not installed. Please install it (apt install whiptail) or use the legacy script."
+    exit 1
 fi
 
-read -p "Enter Container Name [alpine-bentopdf]: " input_name
-CT_NAME=${input_name:-$CT_NAME}
+# --- function to show menu ---
+function selection_menu() {
+    # Find next available CT ID
+    NEXTID=$(pvesh get /cluster/nextid)
+    
+    # Get Storage Pools
+    raw_storage=$(pvesm status -content rootdir | awk 'NR>1 {print $1}')
+    if [ -z "$raw_storage" ]; then
+        raw_storage="local-lvm"
+    fi
+    STORAGE_MENU_ARGS=()
+    while read -r line; do
+        STORAGE_MENU_ARGS+=("$line" "Storage Pool")
+    done <<< "$raw_storage"
 
-read -p "Enter RAM (MB) [2048]: " input_ram
-RAM_SIZE=${input_ram:-$RAM_SIZE}
+    # Dialogs
+    CT_ID=$(whiptail --inputbox "Enter Container ID" 8 78 "$NEXTID" --title "Container ID" 3>&1 1>&2 2>&3)
+    [ -z "$CT_ID" ] && exit 1
 
-read -p "Enter Cores [2]: " input_cores
-CORES=${input_cores:-$CORES}
+    if pct status $CT_ID >/dev/null 2>&1; then
+       whiptail --msgbox "Container $CT_ID already exists!" 8 78
+       exit 1
+    fi
 
-read -p "Enter Disk Size (GB) [4]: " input_disk
-DISK_SIZE=${input_disk:-$DISK_SIZE}
+    CT_NAME=$(whiptail --inputbox "Enter Container Name" 8 78 "$CT_NAME" --title "Container Name" 3>&1 1>&2 2>&3)
+    [ -z "$CT_NAME" ] && exit 1
 
-read -p "Enter Storage Pool [local-lvm]: " input_storage
-STORAGE_POOL=${input_storage:-"local-lvm"}
+    CORES=$(whiptail --inputbox "Enter CPU Cores" 8 78 "$CORES" --title "CPU Allocation" 3>&1 1>&2 2>&3)
+    [ -z "$CORES" ] && exit 1
 
-# Verify Template (Simplification: assuming user has a template or we download one)
-# Ideally, we should check `pveam available` and download if missing.
-# For now, we'll try to use a generic alpine template command or specific one.
-# An easier way is to just use 'alpine-3.19-default' (latest usually) if available/cached
-# or let pct handle download if configured.
-# We will use "system" storage for template by default.
+    RAM_SIZE=$(whiptail --inputbox "Enter RAM (MB)" 8 78 "$RAM_SIZE" --title "Memory Allocation" 3>&1 1>&2 2>&3)
+    [ -z "$RAM_SIZE" ] && exit 1
+
+    DISK_SIZE=$(whiptail --inputbox "Enter Disk Size (GB)" 8 78 "$DISK_SIZE" --title "Disk Allocation" 3>&1 1>&2 2>&3)
+    [ -z "$DISK_SIZE" ] && exit 1
+
+    if [ ${#STORAGE_MENU_ARGS[@]} -eq 2 ]; then
+        STORAGE_POOL=${STORAGE_MENU_ARGS[0]}
+    else
+        STORAGE_POOL=$(whiptail --menu "Select Storage Pool" 15 60 4 "${STORAGE_MENU_ARGS[@]}" --title "Storage Selection" 3>&1 1>&2 2>&3)
+    fi
+    [ -z "$STORAGE_POOL" ] && exit 1
+}
+
+# Run Menu
+selection_menu
+
+# Confirmation
+if ! whiptail --yesno "Ready to create container?\n\nID: $CT_ID\nName: $CT_NAME\nCores: $CORES\nRAM: $RAM_SIZE MB\nDisk: $DISK_SIZE GB\nStorage: $STORAGE_POOL" 15 60; then
+    exit 0
+fi
+
+clear
+
+# Verify Template
 TEMPLATE_SEARCH=$(pveam available | grep alpine | sort -V | tail -n 1 | awk '{print $2}')
 if [ -z "$TEMPLATE_SEARCH" ]; then
-    msg_info "No Alpine template found in available list. Assuming local cache or manual setup."
+    msg_info "No Alpine template found. Assuming local cache or manual setup."
 else
-    # Auto-download latest alpine if not present
     if ! pveam list local | grep -q "alpine"; then
        msg_info "Downloading Alpine template: $TEMPLATE_SEARCH"
        pveam download local "$TEMPLATE_SEARCH"
@@ -91,28 +123,23 @@ msg_info "Waiting for container to start..."
 until pct status $CT_ID | grep -q "status: running"; do
   sleep 1
 done
-sleep 5 # Give it a moment to initialize network
+sleep 5
 
 msg_info "Setting up Alpine Guest..."
-
-# Allow non-interactive commands
 pct exec $CT_ID -- ash -c "apk update && apk add bash curl"
-
-# Fetch and Push the Install Script
-# We need to get the install script into the container.
-# Since we are creating this from a gist or artifacts, we'll write it to a temp file then push.
 
 INSTALL_SCRIPT_LOCAL="/tmp/alpine-bentopdf-install.sh"
 cat << 'EOF' > "$INSTALL_SCRIPT_LOCAL"
 #!/usr/bin/env bash
-# Alpine BentoPDF Install Script
 set -e
 APP="BentoPDF"
 REPO_URL="https://github.com/nickdesi/bentopdf.git"
 INSTALL_DIR="/opt/bentopdf"
 PORT=8080
-green=$(tput setaf 2); red=$(tput setaf 1); reset=$(tput sgr0)
+green=$(tput setaf 2); red=$(tput setaf 1); yellow=$(tput setaf 3); reset=$(tput sgr0)
 msg_ok() { echo -e "${green}✔ $1${reset}"; }
+msg_info() { echo -e "${yellow}ℹ $1${reset}"; }
+
 echo "Updating Alpine..."
 apk update && apk upgrade || true
 echo "Installing Dependencies..."
@@ -206,4 +233,4 @@ rm "$INSTALL_SCRIPT_LOCAL"
 
 msg_info "Installation Complete!"
 CT_IP=$(pct exec $CT_ID -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-echo -e "${green}BentoPDF should be reachable at http://${CT_IP}:8080${reset}"
+whiptail --msgbox "$APP installed successfully!\n\nAccess it at: http://${CT_IP}:8080\n\nRun 'update' inside the container to update." 10 60
